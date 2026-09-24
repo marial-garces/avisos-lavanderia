@@ -1,0 +1,13 @@
+# Entorno virtual
+.venv/
+__pycache__/
+
+# Secretos: NUNCA al repo
+.streamlit/secrets.toml
+
+# Datos de clientes (nombres y teléfonos reales = PII)
+*.csv
+!ejemplo_ordenes.csv
+
+# Basura de macOS
+.DS_Store
