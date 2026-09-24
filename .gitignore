@@ -11,3 +11,6 @@ __pycache__/
 
 # Basura de macOS
 .DS_Store
+
+# Base de datos local (PII)
+*.db
