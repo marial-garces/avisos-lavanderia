@@ -10,7 +10,7 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-#  App de avisos de WhatsApp para lavandería (v4)
+#  App de avisos de WhatsApp para lavandería (v4.1)
 #  Carga CSV -> SQLite -> buscar/marcar -> enviar (demo o real)
 # =========================================================
 
@@ -187,6 +187,7 @@ ss.setdefault("lote", 0)            # al cambiar, se reinician checkboxes y conf
 ss.setdefault("resultados", None)   # sobrevive al st.rerun()
 ss.setdefault("ultimo_archivo", None)
 ss.setdefault("msg_carga", None)
+ss.setdefault("seleccion", set())  # órdenes marcadas, se acumulan entre búsquedas
 
 
 def nuevo_lote():
@@ -221,11 +222,13 @@ with st.sidebar:
     if st.button("🔄 Reiniciar demo", help="Vuelve todas las órdenes a 'pendiente'.", width="stretch"):
         ejecutar("UPDATE ordenes SET estado='pendiente', sid='', enviado_en=''")
         ss.resultados = None
+        ss.seleccion = set()
         nuevo_lote()
         st.rerun()
     if st.button("🗑️ Vaciar base de datos", width="stretch"):
         ejecutar("DELETE FROM ordenes")
         ss.resultados = ss.ultimo_archivo = ss.msg_carga = None
+        ss.seleccion = set()
         nuevo_lote()
         st.rerun()
 
@@ -270,14 +273,13 @@ if ss.resultados is not None:
 
 # ===== SECCIÓN 2: BUSCAR Y MARCAR =====
 st.subheader("🔎 Buscar y seleccionar órdenes")
+st.caption("Las órdenes que marques se van acumulando aunque cambies la búsqueda.")
 
-col1, col2, col3 = st.columns([3, 1, 1])
+col1, col2 = st.columns([4, 1])
 with col1:
     filtro = st.text_input("Buscar por número de orden o nombre", "").strip()
 with col2:
     solo_pend = st.checkbox("Solo pendientes", value=True)
-with col3:
-    marcar_todas = st.checkbox("Marcar todas", value=False, key=f"todas_{ss.lote}")
 
 q = """SELECT orden, fecha, nombre, telefono_norm, monto, valido, problema, estado
        FROM ordenes WHERE 1=1"""
@@ -291,51 +293,91 @@ q += " ORDER BY fecha, orden"
 df_orden = consultar(q, params)
 
 if df_orden.empty:
-    st.info("No hay órdenes que coincidan. Carga un CSV o ajusta la búsqueda.")
+    st.info("No hay órdenes que coincidan con la búsqueda.")
+else:
+    df_orden["valido"] = df_orden["valido"].astype(bool)          # 1/0 -> True/False
+    enviable = df_orden["valido"] & (df_orden["estado"] == "pendiente")
+
+    b1, b2, _ = st.columns([1, 1, 3])
+    if b1.button(f"☑️ Marcar las {int(enviable.sum())} visibles", width="stretch"):
+        ss.seleccion |= set(df_orden.loc[enviable, "orden"])
+        nuevo_lote()
+        st.rerun()
+    if b2.button("✖️ Desmarcar visibles", width="stretch"):
+        ss.seleccion -= set(df_orden["orden"])
+        nuevo_lote()
+        st.rerun()
+
+    # La columna "Enviar" sale de la selección acumulada, no de la posición de la fila
+    df_orden.insert(0, "Enviar", df_orden["orden"].isin(ss.seleccion))
+    df_orden["monto"] = df_orden["monto"].map(lambda m: f"RD${formatear_monto(m)}")
+    vista = df_orden.rename(columns={
+        "orden": "Orden", "fecha": "Fecha", "nombre": "Nombre", "telefono_norm": "Teléfono",
+        "monto": "Monto", "valido": "¿Válido?", "problema": "Problema", "estado": "Estado",
+    })
+
+    editada = st.data_editor(
+        vista,
+        column_config={
+            "Enviar": st.column_config.CheckboxColumn("Enviar", default=False),
+            "¿Válido?": st.column_config.CheckboxColumn("¿Válido?"),
+        },
+        disabled=[c for c in vista.columns if c != "Enviar"],
+        hide_index=True,
+        width="stretch",
+        key=f"editor_{ss.lote}_{filtro}_{solo_pend}",
+    )
+
+    # Sincronizar: lo marcado en pantalla se suma, lo desmarcado se quita.
+    # Las órdenes que no están visibles en esta búsqueda no se tocan.
+    ok_para_enviar = editada["Enviar"] & editada["¿Válido?"] & (editada["Estado"] == "pendiente")
+    ss.seleccion |= set(editada.loc[ok_para_enviar, "Orden"])
+    ss.seleccion -= set(editada.loc[~editada["Enviar"], "Orden"])
+    no_enviables = int((editada["Enviar"] & ~ok_para_enviar).sum())
+    if no_enviables:
+        st.warning(f"{no_enviables} marcadas en esta vista tienen un problema o ya fueron "
+                   f"enviadas: no se agregan a la selección.")
+
+# ===== SELECCIÓN ACUMULADA =====
+# Se lee de la base: solo cuentan las que siguen pendientes y válidas
+if ss.seleccion:
+    marcadores = ",".join("?" * len(ss.seleccion))
+    sel = consultar(f"""SELECT orden AS Orden, fecha AS Fecha, nombre AS Nombre,
+                               telefono_norm AS "Teléfono", monto AS Monto
+                        FROM ordenes WHERE orden IN ({marcadores})
+                          AND estado = 'pendiente' AND valido = 1
+                        ORDER BY fecha, orden""", list(ss.seleccion))
+    ss.seleccion = set(sel["Orden"])  # limpia las que ya no aplican
+else:
+    sel = pd.DataFrame(columns=["Orden", "Fecha", "Nombre", "Teléfono", "Monto"])
+
+st.subheader(f"🧺 Selección acumulada: {len(sel)} órdenes")
+if sel.empty:
+    st.info("Aún no hay órdenes seleccionadas. Búscalas y márcalas arriba.")
     st.stop()
 
-df_orden["valido"] = df_orden["valido"].astype(bool)          # 1/0 -> True/False
-pendiente = df_orden["estado"] == "pendiente"
-df_orden.insert(0, "Enviar", marcar_todas & df_orden["valido"] & pendiente)
-df_orden["monto"] = df_orden["monto"].map(lambda m: f"RD${formatear_monto(m)}")
-vista = df_orden.rename(columns={
-    "orden": "Orden", "fecha": "Fecha", "nombre": "Nombre", "telefono_norm": "Teléfono",
-    "monto": "Monto", "valido": "¿Válido?", "problema": "Problema", "estado": "Estado",
-})
+c1, c2 = st.columns([4, 1])
+with c1:
+    with st.expander("Ver órdenes seleccionadas"):
+        st.dataframe(sel.assign(Monto=sel["Monto"].map(lambda m: f"RD${formatear_monto(m)}")),
+                     hide_index=True, width="stretch")
+with c2:
+    if st.button("🧹 Limpiar selección", width="stretch"):
+        ss.seleccion = set()
+        nuevo_lote()
+        st.rerun()
 
-# La key cambia con el filtro, las opciones y cada envío/carga:
-# así las marcas NUNCA se quedan pegadas a una fila que ahora es otra orden.
-editada = st.data_editor(
-    vista,
-    column_config={
-        "Enviar": st.column_config.CheckboxColumn("Enviar", default=False),
-        "¿Válido?": st.column_config.CheckboxColumn("¿Válido?"),
-    },
-    disabled=[c for c in vista.columns if c != "Enviar"],
-    hide_index=True,
-    width="stretch",
-    key=f"editor_{ss.lote}_{filtro}_{solo_pend}_{marcar_todas}",
-)
-
-marcadas_todas = editada[editada["Enviar"]]
-marcadas = marcadas_todas[marcadas_todas["¿Válido?"] & (marcadas_todas["Estado"] == "pendiente")]
-ignoradas = len(marcadas_todas) - len(marcadas)
-a_enviar = marcadas.head(LOTE_MAX)
-
-st.write(f"**{len(marcadas)}** órdenes marcadas listas para enviar.")
-if ignoradas:
-    st.warning(f"{ignoradas} marcadas tienen un problema o ya fueron enviadas y NO se enviarán.")
-if len(marcadas) > LOTE_MAX:
+a_enviar = sel.head(LOTE_MAX)
+if len(sel) > LOTE_MAX:
     st.warning(f"Por seguridad se envían tandas de {LOTE_MAX}. Esta tanda enviará las primeras "
-               f"{LOTE_MAX}; repite para el resto.")
+               f"{LOTE_MAX}; las demás se quedan seleccionadas para la próxima.")
 
 # ===== VISTA PREVIA DEL MENSAJE =====
-if not a_enviar.empty:
-    ejemplo = a_enviar.iloc[0]
-    with st.container(border=True):
-        st.caption(f"👀 Así le llegaría a {ejemplo['Nombre']} ({ejemplo['Teléfono']}):")
-        st.markdown(texto_mensaje(ejemplo["Nombre"], ejemplo["Orden"], ejemplo["Monto"])
-                    .replace("$", r"\$"))
+ejemplo = a_enviar.iloc[0]
+with st.container(border=True):
+    st.caption(f"👀 Así le llegaría a {ejemplo['Nombre']} ({ejemplo['Teléfono']}):")
+    st.markdown(texto_mensaje(ejemplo["Nombre"], ejemplo["Orden"], ejemplo["Monto"])
+                .replace("$", r"\$"))
 
 # ===== SECCIÓN 3: ENVIAR =====
 verbo = "enviar" if modo_real else "simular el envío de"
@@ -343,7 +385,7 @@ confirmar = st.checkbox(f"Confirmo {verbo} el aviso a las {len(a_enviar)} órden
                         key=f"confirmar_{ss.lote}")
 
 if st.button("📤 Enviar avisos" if modo_real else "🧪 Simular envío",
-             disabled=(not confirmar or a_enviar.empty), type="primary"):
+             disabled=not confirmar, type="primary"):
     client = None
     if modo_real:
         from twilio.rest import Client  # solo se importa si se envía de verdad
@@ -373,5 +415,6 @@ if st.button("📤 Enviar avisos" if modo_real else "🧪 Simular envío",
         barra.progress((i + 1) / total, text=f"Enviando... {i + 1}/{total}")
 
     ss.resultados = pd.DataFrame(resultados)
-    nuevo_lote()   # limpia marcas y confirmación
+    ss.seleccion -= set(a_enviar["Orden"])  # las enviadas salen; el resto queda para la próxima tanda
+    nuevo_lote()   # limpia marcas visuales y confirmación
     st.rerun()
